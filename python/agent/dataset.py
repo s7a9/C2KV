@@ -219,6 +219,47 @@ def _dataset_fingerprint(
     ).hexdigest()[:16]
 
 
+def _open_swe_dataset_fingerprint(
+    files: Sequence[Path],
+    tool_files: Sequence[Path],
+    max_tools: Optional[int],
+    max_input_tokens: Optional[int],
+    max_new_tokens: int,
+    min_messages: Optional[int],
+    max_samples_per_trace: Optional[int],
+    benchmarks: Optional[Sequence[str]],
+) -> str:
+    payload = {
+        "version": 1,
+        "dataset": "open_swe_traces",
+        "max_tools": max_tools,
+        "max_input_tokens": max_input_tokens,
+        "max_new_tokens": max_new_tokens,
+        "min_messages": min_messages,
+        "max_samples_per_trace": max_samples_per_trace,
+        "benchmarks": sorted(benchmarks) if benchmarks is not None else None,
+        "files": [
+            {
+                "path": str(file.resolve()),
+                "size": file.stat().st_size,
+                "mtime_ns": file.stat().st_mtime_ns,
+            }
+            for file in files
+        ],
+        "tool_files": [
+            {
+                "path": str(file.resolve()),
+                "size": file.stat().st_size,
+                "mtime_ns": file.stat().st_mtime_ns,
+            }
+            for file in tool_files
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def _iter_agent_llm_trace_records(
     files: Sequence[str],
     max_tools: Optional[int],
@@ -250,6 +291,144 @@ def _iter_agent_llm_trace_records(
                     yield _agent_example_to_record(example)
 
 
+def _load_open_swe_tools(data_path: Path, scaffold: str) -> List[Dict[str, Any]]:
+    tool_file = data_path / f"{scaffold}_tools.json"
+    if not tool_file.is_file():
+        raise FileNotFoundError(f"Missing Open-SWE tool definition file: {tool_file}")
+    return normalize_tools(json.loads(tool_file.read_text(encoding="utf-8")))
+
+
+def _open_swe_scaffold(file: Path) -> str:
+    parent = file.parent.name.lower()
+    if "openhands" in parent:
+        return "openhands"
+    if "sweagent" in parent:
+        return "sweagent"
+    raise ValueError(f"Cannot infer Open-SWE scaffold from {file}")
+
+
+def _open_swe_file_matches(
+    file: Path,
+    benchmarks: Optional[Sequence[str]],
+) -> bool:
+    if benchmarks is None:
+        return True
+    parent = file.parent.name.lower()
+    candidates = {
+        parent,
+        parent.removesuffix("_trajectories"),
+        file.stem.lower(),
+    }
+    parts = parent.removesuffix("_trajectories").split("_")
+    candidates.update(parts)
+    if parent.startswith("minimax_m25"):
+        candidates.add("minimax_m25")
+    if parent.startswith("qwen35"):
+        candidates.add("qwen35_122b")
+    if "openhands" in parent:
+        candidates.add("openhands")
+    if "sweagent" in parent:
+        candidates.add("sweagent")
+    return bool(candidates.intersection({item.lower() for item in benchmarks}))
+
+
+def _estimate_open_swe_input_tokens(
+    system_prompt: str,
+    messages: Sequence[Dict[str, Any]],
+) -> int:
+    # Open-SWE does not include token counts. This rough filter keeps the
+    # max_input_tokens option useful without adding a tokenizer dependency here.
+    characters = len(system_prompt) + sum(
+        len(str(message.get("content", ""))) for message in messages
+    )
+    return characters // 4
+
+
+def _normalize_open_swe_history_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
+    function = call.get("function") if isinstance(call.get("function"), dict) else call
+    normalized: Dict[str, Any] = {
+        "type": call.get("type") or "function",
+        "function": {
+            "name": function.get("name", ""),
+            "arguments": function.get("arguments", "{}"),
+        },
+    }
+    if call.get("id"):
+        normalized["id"] = call["id"]
+    return normalized
+
+
+def normalize_open_swe_messages(
+    messages: Sequence[Dict[str, Any]],
+) -> tuple[str, List[Dict[str, Any]]]:
+    system_parts: List[str] = []
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content") or ""
+        if role == "system":
+            if content:
+                system_parts.append(content)
+            continue
+
+        normalized_message: Dict[str, Any] = {
+            "role": role,
+            "content": content,
+        }
+        if role == "assistant" and message.get("tool_calls"):
+            normalized_message["tool_calls"] = [
+                _normalize_open_swe_history_tool_call(call)
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict)
+            ]
+        if message.get("tool_call_id"):
+            normalized_message["tool_call_id"] = message["tool_call_id"]
+        if message.get("name"):
+            normalized_message["name"] = message["name"]
+
+        if content or role in {"assistant", "tool"}:
+            normalized.append(normalized_message)
+
+    system_prompt = "\n".join(system_parts).strip() or DEFAULT_SYSTEM_PROMPT
+    return system_prompt, normalized
+
+
+def _iter_open_swe_trace_records(
+    files: Sequence[str],
+    data_path: str,
+    max_tools: Optional[int],
+    max_input_tokens: Optional[int],
+    max_new_tokens: int,
+    min_messages: Optional[int],
+    max_samples_per_trace: Optional[int],
+) -> Iterator[Dict[str, Any]]:
+    import pyarrow.parquet as pq
+
+    root = Path(data_path)
+    tools_by_scaffold: Dict[str, List[Dict[str, Any]]] = {}
+    for file_name in files:
+        file = Path(file_name)
+        scaffold = _open_swe_scaffold(file)
+        if scaffold not in tools_by_scaffold:
+            tools_by_scaffold[scaffold] = _load_open_swe_tools(root, scaffold)
+        tools = tools_by_scaffold[scaffold]
+        if max_tools is not None and len(tools) > max_tools:
+            continue
+
+        table = pq.read_table(file)
+        for row_index, row in enumerate(table.to_pylist()):
+            for example in OpenSWETracesDataset._extract_examples(
+                row,
+                tools,
+                f"{file.parent.name}/{file.name}:{row_index}",
+                max_input_tokens=max_input_tokens,
+                max_new_tokens=max_new_tokens,
+                min_messages=min_messages,
+                max_samples_per_trace=max_samples_per_trace,
+            ):
+                yield _agent_example_to_record(example)
+
+
 class AgentLLMTracesDataset(AgentDataset):
     """Simple tool-call subset of Exgentic/agent-llm-traces."""
 
@@ -261,6 +440,8 @@ class AgentLLMTracesDataset(AgentDataset):
         max_input_tokens: Optional[int] = None,
         max_new_tokens: int = 128,
         benchmark: Optional[str | Sequence[str]] = None,
+        min_messages: Optional[int] = None,
+        max_samples_per_trace: Optional[int] = None,
         use_hf_cache: bool = True,
         dataset_cache_dir: Optional[str] = None,
     ) -> None:
@@ -401,6 +582,185 @@ class AgentLLMTracesDataset(AgentDataset):
         return self.examples[index]
 
 
+class OpenSWETracesDataset(AgentDataset):
+    """Tool-call prediction samples from nvidia/Open-SWE-Traces trajectories."""
+
+    def __init__(
+        self,
+        data_path: str,
+        max_samples: Optional[int] = None,
+        max_tools: Optional[int] = None,
+        max_input_tokens: Optional[int] = None,
+        max_new_tokens: int = 128,
+        benchmark: Optional[str | Sequence[str]] = None,
+        min_messages: Optional[int] = None,
+        max_samples_per_trace: Optional[int] = None,
+        use_hf_cache: Optional[bool] = None,
+        dataset_cache_dir: Optional[str] = None,
+    ) -> None:
+        if min_messages is not None and min_messages < 1:
+            raise ValueError("min_messages must be >= 1")
+        if max_samples_per_trace is not None and max_samples_per_trace < 1:
+            raise ValueError("max_samples_per_trace must be >= 1")
+        self.data_path = Path(data_path).expanduser()
+        data_dir = (
+            self.data_path / "data"
+            if (self.data_path / "data").is_dir()
+            else self.data_path
+        )
+        benchmarks = _normalize_benchmarks(benchmark)
+        files = sorted(
+            file
+            for file in data_dir.glob("*_trajectories/*.parquet")
+            if _open_swe_file_matches(file, benchmarks)
+        )
+        if not files:
+            raise FileNotFoundError(f"No Open-SWE parquet files found under {data_dir}")
+
+        self.max_new_tokens = max_new_tokens
+        if use_hf_cache is None:
+            use_hf_cache = max_samples is None
+        if use_hf_cache:
+            self.dataset = self._load_hf_dataset(
+                files,
+                self.data_path,
+                max_samples=max_samples,
+                max_tools=max_tools,
+                max_input_tokens=max_input_tokens,
+                max_new_tokens=max_new_tokens,
+                min_messages=min_messages,
+                max_samples_per_trace=max_samples_per_trace,
+                benchmarks=benchmarks,
+                dataset_cache_dir=dataset_cache_dir,
+            )
+            self.examples = None
+        else:
+            self.dataset = None
+            self.examples: Optional[List[AgentExample]] = []
+            for record in _iter_open_swe_trace_records(
+                [str(file) for file in files],
+                data_path=str(self.data_path),
+                max_tools=max_tools,
+                max_input_tokens=max_input_tokens,
+                max_new_tokens=max_new_tokens,
+                min_messages=min_messages,
+                max_samples_per_trace=max_samples_per_trace,
+            ):
+                self.examples.append(_record_to_agent_example(record))
+                if max_samples is not None and len(self.examples) >= max_samples:
+                    return
+
+    @staticmethod
+    def _load_hf_dataset(
+        files: Sequence[Path],
+        data_path: Path,
+        max_samples: Optional[int],
+        max_tools: Optional[int],
+        max_input_tokens: Optional[int],
+        max_new_tokens: int,
+        min_messages: Optional[int],
+        max_samples_per_trace: Optional[int],
+        benchmarks: Optional[Sequence[str]],
+        dataset_cache_dir: Optional[str],
+    ) -> Any:
+        from datasets import Dataset, Features, Value
+
+        features = Features(
+            {
+                "qid": Value("string"),
+                "system_prompt": Value("string"),
+                "tools": Value("string"),
+                "messages": Value("string"),
+                "expected_tool_calls": Value("string"),
+                "max_new_tokens": Value("int64"),
+            }
+        )
+        tool_files = sorted(data_path.glob("*_tools.json"))
+        dataset = Dataset.from_generator(
+            _iter_open_swe_trace_records,
+            features=features,
+            cache_dir=dataset_cache_dir,
+            gen_kwargs={
+                "files": [str(file) for file in files],
+                "data_path": str(data_path),
+                "max_tools": max_tools,
+                "max_input_tokens": max_input_tokens,
+                "max_new_tokens": max_new_tokens,
+                "min_messages": min_messages,
+                "max_samples_per_trace": max_samples_per_trace,
+            },
+            fingerprint=_open_swe_dataset_fingerprint(
+                files,
+                tool_files,
+                max_tools=max_tools,
+                max_input_tokens=max_input_tokens,
+                max_new_tokens=max_new_tokens,
+                min_messages=min_messages,
+                max_samples_per_trace=max_samples_per_trace,
+                benchmarks=benchmarks,
+            ),
+        )
+        if max_samples is not None and len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
+        return dataset
+
+    @staticmethod
+    def _extract_examples(
+        row: Dict[str, Any],
+        tools: List[Dict[str, Any]],
+        qid: str,
+        max_input_tokens: Optional[int],
+        max_new_tokens: int = 128,
+        min_messages: Optional[int] = None,
+        max_samples_per_trace: Optional[int] = None,
+    ) -> Iterator[AgentExample]:
+        trajectory = row.get("trajectory") or []
+        yielded = 0
+        for message_index, message in enumerate(trajectory):
+            if max_samples_per_trace is not None and yielded >= max_samples_per_trace:
+                break
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            system_prompt, messages = normalize_open_swe_messages(
+                trajectory[:message_index]
+            )
+            if not messages:
+                continue
+            if min_messages is not None and len(messages) < min_messages:
+                continue
+            if (
+                max_input_tokens is not None
+                and _estimate_open_swe_input_tokens(system_prompt, messages)
+                > max_input_tokens
+            ):
+                continue
+            yielded += 1
+            yield AgentExample(
+                qid=f"{qid}:{message_index}",
+                system_prompt=system_prompt,
+                tools=tools,
+                messages=messages,
+                expected_tool_calls=[
+                    _normalize_call(call)
+                    for call in message.get("tool_calls") or []
+                    if isinstance(call, dict)
+                ],
+                max_new_tokens=max_new_tokens,
+            )
+
+    def __len__(self) -> int:
+        if self.dataset is not None:
+            return len(self.dataset)
+        assert self.examples is not None
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> AgentExample:
+        if self.dataset is not None:
+            return _record_to_agent_example(self.dataset[index])
+        assert self.examples is not None
+        return self.examples[index]
+
+
 def load_agent_dataset(
     name: str,
     path: str,
@@ -408,4 +768,6 @@ def load_agent_dataset(
 ) -> AgentDataset:
     if name == "agent_llm_traces":
         return AgentLLMTracesDataset(path, **kwargs)
+    if name == "open_swe_traces":
+        return OpenSWETracesDataset(path, **kwargs)
     raise ValueError(f"Unsupported agent dataset: {name}")

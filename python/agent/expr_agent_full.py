@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--max-examples", type=int)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument(
+        "--max-samples-per-trace",
+        type=int,
+        help="For open_swe_traces, cap the number of tool-call samples produced from each trace",
+    )
     parser.add_argument("--max-tools", type=int)
     parser.add_argument(
         "--benchmark",
@@ -107,6 +112,7 @@ def main() -> None:
         args.dataset_path,
         max_samples=args.max_samples,
         max_tools=args.max_tools,
+        max_samples_per_trace=args.max_samples_per_trace,
         max_new_tokens=args.max_new_tokens,
         benchmark=args.benchmark,
     )

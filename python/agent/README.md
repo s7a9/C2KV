@@ -26,6 +26,15 @@ run builds an Arrow cache for the filtered simple tool-call subset; later runs
 with the same parquet files and preprocessing parameters load it directly via
 the default `datasets` cache configuration.
 
+`OpenSWETracesDataset` supports NVIDIA Open-SWE-Traces local exports such as
+`/home/nas/dch/datasets/nvidia--Open-SWE-Traces/`. Use
+`--dataset open_swe_traces`; `--benchmark` may be used to keep only a scaffold
+or split, for example `openhands`, `sweagent`, `qwen35`, `minimax`, or a full
+directory name like `qwen35_openhands_trajectories`. In history-compression
+experiments, `--history-message-range` is used to skip shallow tool-call
+prediction samples before applying `--max-samples-per-trace`, which caps how
+many samples each single trajectory can contribute.
+
 ```bash
 export PYTHONPATH=$PWD/python
 
@@ -54,4 +63,15 @@ python python/agent/expr_agent_c2kv_api.py \
   --max-examples 5 \
   --save-inputs \
   --output-file results/agent_c2kv_api.jsonl
+
+python python/agent/expr_agent_c2kv_api.py \
+  --base-url http://localhost:30000 \
+  --model default \
+  --tokenizer <c2kv-checkpoint-path> \
+  --dataset open_swe_traces \
+  --dataset-path /home/nas/dch/datasets/nvidia--Open-SWE-Traces \
+  --benchmark openhands \
+  --max-samples-per-trace 3 \
+  --max-samples 1000 \
+  --output-file results/open_swe_c2kv_api.jsonl
 ```

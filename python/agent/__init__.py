@@ -3,6 +3,7 @@ from .dataset import (
     AgentExample,
     AgentLLMTracesDataset,
     DEFAULT_SYSTEM_PROMPT,
+    OpenSWETracesDataset,
     load_agent_dataset,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "AgentExample",
     "AgentLLMTracesDataset",
     "DEFAULT_SYSTEM_PROMPT",
+    "OpenSWETracesDataset",
     "load_agent_dataset",
 ]
