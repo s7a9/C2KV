@@ -45,6 +45,12 @@ class LRUCache:
             while len(self._items) > self.capacity:
                 self._items.popitem(last=False)
 
+    def clear(self) -> int:
+        with self._lock:
+            size = len(self._items)
+            self._items.clear()
+            return size
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)
@@ -323,6 +329,11 @@ class C2KVProxy:
         url = f"{self.upstream_base_url}{path}"
         return requests.get(url, timeout=self.args.request_timeout)
 
+    def clear_cache(self) -> JSONDict:
+        cleared = self.cache.clear()
+        LOGGER.info("cleared proxy cache entries=%s", cleared)
+        return {"status": "ok", "cleared_entries": cleared, "cache_size": len(self.cache)}
+
 
 def make_handler(proxy: C2KVProxy) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -382,6 +393,10 @@ def make_handler(proxy: C2KVProxy) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
             started = time.perf_counter()
+            if path in {"/clear_cache", "/v1/c2kv/proxy/cache/clear"}:
+                self._send_json(200, proxy.clear_cache())
+                return
+
             payload = self._read_json()
             if payload is None:
                 LOGGER.warning("POST path=%s invalid_json client=%s", path, self.client_address)

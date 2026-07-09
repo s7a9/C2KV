@@ -20,6 +20,7 @@ class AgentExample:
     messages: List[Dict[str, Any]]
     expected_tool_calls: List[Dict[str, Any]]
     max_new_tokens: Optional[int] = None
+    expected_answer: Optional[str] = None
 
 
 class AgentDataset(ABC):
@@ -165,6 +166,7 @@ def _agent_example_to_record(example: AgentExample) -> Dict[str, Any]:
             ensure_ascii=False,
         ),
         "max_new_tokens": example.max_new_tokens,
+        "expected_answer": example.expected_answer,
     }
 
 
@@ -176,6 +178,7 @@ def _record_to_agent_example(record: Dict[str, Any]) -> AgentExample:
         messages=_json_loads(record["messages"], []),
         expected_tool_calls=_json_loads(record["expected_tool_calls"], []),
         max_new_tokens=record.get("max_new_tokens"),
+        expected_answer=record.get("expected_answer"),
     )
 
 
@@ -258,6 +261,110 @@ def _open_swe_dataset_fingerprint(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
+
+
+def _stream_json_array(path: Path, chunk_size: int = 1 << 20) -> Iterator[Dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8") as handle:
+        buffer = ""
+        position = 0
+        eof = False
+        started = False
+        while True:
+            if position >= len(buffer) and not eof:
+                more = handle.read(chunk_size)
+                if not more:
+                    eof = True
+                buffer = buffer[position:] + more
+                position = 0
+
+            length = len(buffer)
+            while position < length and buffer[position].isspace():
+                position += 1
+            if not started:
+                if position >= length and not eof:
+                    continue
+                if position >= length or buffer[position] != "[":
+                    raise ValueError(f"Expected top-level JSON array in {path}")
+                position += 1
+                started = True
+
+            while position < length and buffer[position].isspace():
+                position += 1
+            if position < length and buffer[position] == "]":
+                return
+            if position < length and buffer[position] == ",":
+                position += 1
+                continue
+
+            try:
+                item, end = decoder.raw_decode(buffer, position)
+            except json.JSONDecodeError:
+                if eof:
+                    raise
+                buffer = buffer[position:] + handle.read(chunk_size)
+                position = 0
+                continue
+
+            if isinstance(item, dict):
+                yield item
+            position = end
+            if position > (1 << 22):
+                buffer = buffer[position:]
+                position = 0
+
+
+def _longmemeval_file_matches(
+    file: Path,
+    benchmarks: Optional[Sequence[str]],
+) -> bool:
+    if benchmarks is None:
+        return file.name == "longmemeval_m_cleaned.json"
+    aliases = {
+        "s": "longmemeval_s_cleaned.json",
+        "small": "longmemeval_s_cleaned.json",
+        "m": "longmemeval_m_cleaned.json",
+        "medium": "longmemeval_m_cleaned.json",
+        "oracle": "longmemeval_oracle.json",
+    }
+    wanted = {item.lower() for item in benchmarks}
+    candidates = {
+        file.name.lower(),
+        file.stem.lower(),
+        file.stem.lower().removeprefix("longmemeval_").removesuffix("_cleaned"),
+    }
+    candidates.update(
+        key for key, value in aliases.items() if value.lower() == file.name.lower()
+    )
+    return bool(candidates.intersection(wanted))
+
+
+def _normalize_longmemeval_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    role = message.get("role", "user")
+    if role not in {"user", "assistant", "system"}:
+        role = "user"
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    if not content and role != "assistant":
+        return None
+    return {"role": role, "content": content}
+
+
+def _iter_longmemeval_records(
+    files: Sequence[str],
+    max_new_tokens: int,
+) -> Iterator[Dict[str, Any]]:
+    for file_name in files:
+        file = Path(file_name)
+        for row in _stream_json_array(file):
+            example = LongMemEvalDataset._extract_example(
+                row,
+                qid_prefix=file.stem,
+                max_new_tokens=max_new_tokens,
+            )
+            if example is not None:
+                yield _agent_example_to_record(example)
 
 
 def _iter_agent_llm_trace_records(
@@ -502,6 +609,7 @@ class AgentLLMTracesDataset(AgentDataset):
                 "messages": Value("string"),
                 "expected_tool_calls": Value("string"),
                 "max_new_tokens": Value("int64"),
+                "expected_answer": Value("string"),
             }
         )
         dataset = Dataset.from_generator(
@@ -673,6 +781,7 @@ class OpenSWETracesDataset(AgentDataset):
                 "messages": Value("string"),
                 "expected_tool_calls": Value("string"),
                 "max_new_tokens": Value("int64"),
+                "expected_answer": Value("string"),
             }
         )
         tool_files = sorted(data_path.glob("*_tools.json"))
@@ -689,16 +798,16 @@ class OpenSWETracesDataset(AgentDataset):
                 "min_messages": min_messages,
                 "max_samples_per_trace": max_samples_per_trace,
             },
-            fingerprint=_open_swe_dataset_fingerprint(
-                files,
-                tool_files,
-                max_tools=max_tools,
-                max_input_tokens=max_input_tokens,
-                max_new_tokens=max_new_tokens,
-                min_messages=min_messages,
-                max_samples_per_trace=max_samples_per_trace,
-                benchmarks=benchmarks,
-            ),
+            # fingerprint=_open_swe_dataset_fingerprint(
+            #     files,
+            #     tool_files,
+            #     max_tools=max_tools,
+            #     max_input_tokens=max_input_tokens,
+            #     max_new_tokens=max_new_tokens,
+            #     min_messages=min_messages,
+            #     max_samples_per_trace=max_samples_per_trace,
+            #     benchmarks=benchmarks,
+            # ),
         )
         if max_samples is not None and len(dataset) > max_samples:
             dataset = dataset.select(range(max_samples))
@@ -761,6 +870,195 @@ class OpenSWETracesDataset(AgentDataset):
         return self.examples[index]
 
 
+class LongMemEvalDataset(AgentDataset):
+    """Question-answer samples from LongMemEval cleaned history sessions."""
+
+    default_system_prompt = (
+        "You are a helpful assistant. Answer the user's question using the "
+        "provided conversation history. Keep the answer concise."
+    )
+    max_new_tokens = 256
+
+    def __init__(
+        self,
+        data_path: str,
+        max_samples: Optional[int] = None,
+        max_tools: Optional[int] = None,
+        max_input_tokens: Optional[int] = None,
+        max_new_tokens: int = 256,
+        benchmark: Optional[str | Sequence[str]] = None,
+        min_messages: Optional[int] = None,
+        max_samples_per_trace: Optional[int] = None,
+        use_hf_cache: Optional[bool] = None,
+        dataset_cache_dir: Optional[str] = None,
+    ) -> None:
+        if max_tools is not None and max_tools < 0:
+            raise ValueError("max_tools must be >= 0")
+        if max_samples_per_trace is not None:
+            raise ValueError("LongMemEval does not support max_samples_per_trace")
+        self.data_path = Path(data_path).expanduser()
+        if self.data_path.is_file():
+            files = [self.data_path]
+        else:
+            benchmarks = _normalize_benchmarks(benchmark)
+            files = sorted(
+                file
+                for file in self.data_path.glob("longmemeval*.json")
+                if _longmemeval_file_matches(file, benchmarks)
+            )
+        if not files:
+            raise FileNotFoundError(f"No LongMemEval JSON files found under {self.data_path}")
+
+        self.max_new_tokens = max_new_tokens
+        if use_hf_cache is None:
+            use_hf_cache = max_samples is None
+        if use_hf_cache:
+            self.dataset = self._load_hf_dataset(
+                files,
+                max_samples=max_samples,
+                max_new_tokens=max_new_tokens,
+                benchmarks=_normalize_benchmarks(benchmark),
+                dataset_cache_dir=dataset_cache_dir,
+            )
+            self.examples = None
+        else:
+            self.dataset = None
+            self.examples: Optional[List[AgentExample]] = []
+            for record in _iter_longmemeval_records(
+                [str(file) for file in files],
+                max_new_tokens=max_new_tokens,
+            ):
+                example = _record_to_agent_example(record)
+                history_messages = len(example.messages) - 2
+                if min_messages is not None and history_messages < min_messages:
+                    continue
+                if (
+                    max_input_tokens is not None
+                    and _estimate_open_swe_input_tokens(example.system_prompt, example.messages)
+                    > max_input_tokens
+                ):
+                    continue
+                self.examples.append(example)
+                if max_samples is not None and len(self.examples) >= max_samples:
+                    return
+
+    @staticmethod
+    def _load_hf_dataset(
+        files: Sequence[Path],
+        max_samples: Optional[int],
+        max_new_tokens: int,
+        benchmarks: Optional[Sequence[str]],
+        dataset_cache_dir: Optional[str],
+    ) -> Any:
+        from datasets import Dataset, Features, Value
+
+        features = Features(
+            {
+                "qid": Value("string"),
+                "system_prompt": Value("string"),
+                "tools": Value("string"),
+                "messages": Value("string"),
+                "expected_tool_calls": Value("string"),
+                "max_new_tokens": Value("int64"),
+                "expected_answer": Value("string"),
+            }
+        )
+        dataset = Dataset.from_generator(
+            _iter_longmemeval_records,
+            features=features,
+            cache_dir=dataset_cache_dir,
+            gen_kwargs={
+                "files": [str(file) for file in files],
+                "max_new_tokens": max_new_tokens,
+            },
+        )
+        if max_samples is not None and len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
+        return dataset
+
+    @staticmethod
+    def _extract_example(
+        row: Dict[str, Any],
+        qid_prefix: str,
+        max_new_tokens: int,
+    ) -> Optional[AgentExample]:
+        question = str(row.get("question") or "").strip()
+        answer = str(row.get("answer") or "").strip()
+        sessions = row.get("haystack_sessions") or []
+        if not question or not answer or not sessions:
+            return None
+
+        history: List[Dict[str, Any]] = []
+        for session_index, session in enumerate(sessions):
+            if not isinstance(session, list):
+                continue
+            session_id = ""
+            session_ids = row.get("haystack_session_ids") or []
+            if session_index < len(session_ids):
+                session_id = str(session_ids[session_index])
+            if session_id:
+                history.append(
+                    {
+                        "role": "user",
+                        "content": f"[History session: {session_id}]",
+                    }
+                )
+            for raw_message in session:
+                if not isinstance(raw_message, dict):
+                    continue
+                message = _normalize_longmemeval_message(raw_message)
+                if message is not None:
+                    history.append(message)
+
+        if not history:
+            return None
+
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "I will ask a question about previous conversations. "
+                    "Use the following history and answer only the question."
+                ),
+            },
+            *history,
+            {"role": "user", "content": question},
+        ]
+        qid = str(row.get("question_id") or "")
+        if not qid:
+            qid = f"{qid_prefix}:{hashlib.sha1(question.encode('utf-8')).hexdigest()[:12]}"
+        return AgentExample(
+            qid=f"{qid_prefix}:{qid}",
+            system_prompt=LongMemEvalDataset.default_system_prompt,
+            tools=[],
+            messages=messages,
+            expected_tool_calls=[],
+            max_new_tokens=max_new_tokens,
+            expected_answer=answer,
+        )
+
+    def score(self, prediction: str, example: AgentExample) -> float:
+        answer = (example.expected_answer or "").strip().lower()
+        prediction = (prediction or "").strip().lower()
+        if not answer:
+            return 0.0
+        if prediction == answer or answer in prediction:
+            return 1.0
+        return 0.0
+
+    def __len__(self) -> int:
+        if self.dataset is not None:
+            return len(self.dataset)
+        assert self.examples is not None
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> AgentExample:
+        if self.dataset is not None:
+            return _record_to_agent_example(self.dataset[index])
+        assert self.examples is not None
+        return self.examples[index]
+
+
 def load_agent_dataset(
     name: str,
     path: str,
@@ -770,4 +1068,6 @@ def load_agent_dataset(
         return AgentLLMTracesDataset(path, **kwargs)
     if name == "open_swe_traces":
         return OpenSWETracesDataset(path, **kwargs)
+    if name == "longmemeval":
+        return LongMemEvalDataset(path, **kwargs)
     raise ValueError(f"Unsupported agent dataset: {name}")

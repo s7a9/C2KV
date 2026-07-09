@@ -39,6 +39,8 @@ def example_result(
         "expected_tool_calls": example.expected_tool_calls,
         "score": dataset.score(prediction, example),
     }
+    if example.expected_answer is not None:
+        result["expected_answer"] = example.expected_answer
     if timer is not None:
         result["timer"] = timer
     return result

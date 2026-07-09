@@ -74,4 +74,14 @@ python python/agent/expr_agent_c2kv_api.py \
   --max-samples-per-trace 3 \
   --max-samples 1000 \
   --output-file results/open_swe_c2kv_api.jsonl
+
+python python/agent/expr_compress_history_api.py \
+  --base-url http://localhost:30000 \
+  --model default \
+  --tokenizer <c2kv-checkpoint-path> \
+  --dataset longmemeval \
+  --dataset-path /home/nas/dch/datasets/longmemeval-cleaned \
+  --benchmark s \
+  --max-examples 10 \
+  --output-file results/longmemeval_compress_history.jsonl
 ```

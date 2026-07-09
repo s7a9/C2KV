@@ -404,6 +404,22 @@ def add_soft_tool_metrics(record: Dict[str, Any]) -> None:
 
 
 def add_behavior_metrics(results: List[Dict[str, Any]]) -> None:
+    if any(record.get("expected_answer") is not None for record in results):
+        baseline_predictions = {
+            record["qid"]: record.get("prediction", "")
+            for record in results
+            if record.get("experiment_type") == "no_reuse"
+        }
+        for record in results:
+            baseline_prediction = baseline_predictions.get(record["qid"])
+            if record.get("experiment_type") == "no_reuse" or baseline_prediction is None:
+                continue
+            record["behavior_exact_match"] = float(
+                (record.get("prediction") or "").strip().lower()
+                == (baseline_prediction or "").strip().lower()
+            )
+        return
+
     baseline_calls = {
         record["qid"]: _prediction_metric_call(record.get("prediction", ""))
         for record in results
@@ -430,6 +446,12 @@ def _mean_metric(records: Sequence[Dict[str, Any]], key: str) -> float:
 
 
 def _metric_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    has_answer = any(record.get("expected_answer") is not None for record in records)
+    if has_answer:
+        return {
+            "accuracy": _mean_metric(records, "score"),
+            "behavior_exact_match": _mean_metric(records, "behavior_exact_match"),
+        }
     return {
         "tool_call_accuracy": _mean_metric(records, "score"),
         "parse_rate": _mean_metric(records, "parse_success"),
@@ -441,6 +463,11 @@ def _metric_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "behavior_tool_name_match": _mean_metric(records, "behavior_tool_name_match"),
         "behavior_soft_tool_score": _mean_metric(records, "behavior_soft_tool_score"),
     }
+
+
+def add_record_metrics(record: Dict[str, Any]) -> None:
+    if record.get("expected_answer") is None:
+        add_soft_tool_metrics(record)
 
 
 def save_compress_history_results(
@@ -664,7 +691,7 @@ def _process_example(
                 "chat_total_so_far": round(chat_time, 4),
             }
         record = example_result(args.dataset_obj, example, prediction, timer)
-        add_soft_tool_metrics(record)
+        add_record_metrics(record)
         record.update(
             {
                 "reuse_pattern": "none",
@@ -737,7 +764,7 @@ def _process_example(
                     "chat_total_so_far": round(chat_time, 4),
                 }
             record = example_result(args.dataset_obj, example, prediction, timer)
-            add_soft_tool_metrics(record)
+            add_record_metrics(record)
             record.update(
                 {
                     "experiment_type": "drop_prefix",
@@ -824,7 +851,7 @@ def _process_example(
                         "chat_total_so_far": round(chat_time, 4),
                     }
                 record = example_result(args.dataset_obj, example, prediction, timer)
-                add_soft_tool_metrics(record)
+                add_record_metrics(record)
                 record.update(
                     {
                         "reuse_pattern": pattern,
@@ -1155,12 +1182,19 @@ def main() -> None:
     )
     print(f"Loaded {len(dataset)} examples from {args.dataset}")
     summary = evaluate(args, dataset)
-    print(f"\nTool-call accuracy: {summary['tool_call_accuracy']:.4f}")
-    print(f"Soft tool score: {summary['soft_tool_score']:.4f}")
-    print(
-        "Behavior preservation score: "
-        f"{summary['behavior_soft_tool_score']:.4f}"
-    )
+    if "tool_call_accuracy" in summary:
+        print(f"\nTool-call accuracy: {summary['tool_call_accuracy']:.4f}")
+        print(f"Soft tool score: {summary['soft_tool_score']:.4f}")
+        print(
+            "Behavior preservation score: "
+            f"{summary['behavior_soft_tool_score']:.4f}"
+        )
+    else:
+        print(f"\nAccuracy: {summary['accuracy']:.4f}")
+        print(
+            "Behavior exact match: "
+            f"{summary['behavior_exact_match']:.4f}"
+        )
     if args.output_file:
         print(f"Saved predictions to {args.output_file}")
 
