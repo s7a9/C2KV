@@ -11,6 +11,7 @@ from transformers.utils import logging
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from gist_args import ModelArgs
+from pic_args import PICModelArgs
 
 logger = getLogger(__name__)
 
@@ -53,31 +54,35 @@ def get_model_class(
     model_name_or_path: str,
     gist_param_type: str,
 ) -> Tuple[Type[PretrainedConfig], Type[PreTrainedModel]]:
-    if gist_param_type == "qkv":
+    if gist_param_type == "pic":
+        from .qwen3 import Qwen3ForCausalLM, Qwen3Config
+        architecture_to_class = {
+            'Qwen3ForCausalLM': (Qwen3Config, Qwen3ForCausalLM),
+        }
+    elif gist_param_type == "qkv":
         from .llama import LlamaForCausalLM, LlamaConfig
         from .qwen2_5 import Qwen2ForCausalLM, Qwen2Config
-        from .qwen3 import Qwen3ForCausalLM, Qwen3Config
+        architecture_to_class = {
+            'LlamaForCausalLM': (LlamaConfig, LlamaForCausalLM),
+            'Qwen2ForCausalLM': (Qwen2Config, Qwen2ForCausalLM),
+        }
     else:
         raise ValueError(f"Unsupported gist_param_type: {gist_param_type}")
-    ARCHITECTURE_TO_CLASS = {
-        'LlamaForCausalLM': (LlamaConfig, LlamaForCausalLM),
-        'Qwen2ForCausalLM': (Qwen2Config, Qwen2ForCausalLM),
-        'Qwen3ForCausalLM': (Qwen3Config, Qwen3ForCausalLM),
-    }
     probe_config = AutoConfig.from_pretrained(
         model_name_or_path, 
         trust_remote_code=True,
         local_files_only=True,
     )
     architecture = probe_config.architectures[0]
-    if architecture not in ARCHITECTURE_TO_CLASS:
-        raise ValueError(f"Unsupported architecture: {architecture}")
-    config_class, model_class = ARCHITECTURE_TO_CLASS[architecture]
+    if architecture not in architecture_to_class:
+        supported = ", ".join(architecture_to_class)
+        raise ValueError(f"Unsupported architecture {architecture}; expected one of: {supported}")
+    config_class, model_class = architecture_to_class[architecture]
     return config_class, model_class
 
 
 def get_model_and_tokenizer(
-    model_args: ModelArgs, 
+    model_args: ModelArgs | PICModelArgs,
     device: str="cuda", 
     evaluation_mode: bool=True, 
     return_tokenizer_only: bool=False, 
@@ -149,7 +154,30 @@ def get_model_and_tokenizer(
         if k.startswith("gist") and v is not None:
             gist_kwargs[k] = v
 
-    if model_args_dict["enable_gist"]:
+    enable_pic = model_args_dict.get("enable_pic", False)
+    enable_gist = model_args_dict.get("enable_gist", False)
+    if enable_pic and enable_gist:
+        raise ValueError("enable_pic and enable_gist are mutually exclusive")
+
+    if enable_pic:
+        config_class, model_class = get_model_class(model_name_or_path, "pic")
+        config = config_class.from_pretrained(
+            model_name_or_path,
+            dtype=dtype,
+            local_files_only=True,
+            pic_enabled=True,
+            pic_param=model_args_dict["pic_param"],
+            **rope_kwargs,
+            **attn_kwargs,
+        )
+        model = model_class.from_pretrained(
+            model_name_or_path,
+            config=config,
+            dtype=dtype,
+            device_map=device_map,
+            local_files_only=True,
+        )
+    elif enable_gist:
         gist_lora = model_args_dict["gist_param"] == 'lora'
         config_class, model_class = get_model_class(model_name_or_path, "lora" if gist_lora else "qkv")
 

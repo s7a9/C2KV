@@ -39,10 +39,11 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 from .configuration_qwen3 import Qwen3Config
 
-from ..gist_utils import (
-    get_prepare_gist_input_func, process_context_input_ids,
-    gen_gist_proj, init_gist_proj, init_gist_embed, GistModelOutputWithPast,
-    get_apply_gist_residual_func, GIST_GRADIENT_CHECKPOINTING,
+from .. import pic_utils
+from ..pic_utils import (
+    init_missing_residual_projections,
+    make_residual_projection,
+    process_context_input_ids,
 )
 
 
@@ -212,15 +213,39 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 
-        self.gist_param = '' if config.gist_param is None else config.gist_param
-        self.apply_gist_residual = get_apply_gist_residual_func(config, layer_idx)
-        init_gist_param = self.gist_param.lower()
-        if 'q' in init_gist_param:
-            self.gist_q_proj = gen_gist_proj(config.num_attention_heads * self.head_dim, config)
-        if 'k' in init_gist_param:
-            self.gist_k_proj = gen_gist_proj(config.num_key_value_heads * self.head_dim, config)
-        if 'v' in init_gist_param:
-            self.gist_v_proj = gen_gist_proj(config.num_key_value_heads * self.head_dim, config)
+        self.pic_enabled = config.pic_enabled
+        self.pic_param = config.pic_param.lower()
+        if self.pic_enabled and 'q' in self.pic_param:
+            self.residual_q_proj = make_residual_projection(
+                config.hidden_size, config.num_attention_heads * self.head_dim, config.attention_bias
+            )
+        if self.pic_enabled and 'k' in self.pic_param:
+            self.residual_k_proj = make_residual_projection(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, config.attention_bias
+            )
+        if self.pic_enabled and 'v' in self.pic_param:
+            self.residual_v_proj = make_residual_projection(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, config.attention_bias
+            )
+
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        use_pic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        if use_pic:
+            if not self.pic_enabled:
+                raise ValueError("use_pic=True requires a model configured with pic_enabled=True")
+            if hasattr(self, "residual_q_proj"):
+                query_states = query_states + self.residual_q_proj(hidden_states)
+            if hasattr(self, "residual_k_proj"):
+                key_states = key_states + self.residual_k_proj(hidden_states)
+            if hasattr(self, "residual_v_proj"):
+                value_states = value_states + self.residual_v_proj(hidden_states)
+        return query_states, key_states, value_states
 
     def forward(
         self,
@@ -233,20 +258,18 @@ class Qwen3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        use_gist = kwargs.get("use_gist", False)
-        q_proj = self.gist_q_proj if use_gist and 'Q' in self.gist_param else self.q_proj
-        k_proj = self.gist_k_proj if use_gist and 'K' in self.gist_param else self.k_proj
-        v_proj = self.gist_v_proj if use_gist and 'V' in self.gist_param else self.v_proj
-
-        query_states = self.q_norm(q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states, value_states = self._project_qkv(
+            hidden_states, use_pic=kwargs.get("use_pic", False)
+        )
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            if self.training:  # when gist training, splice the cached gist KVs onto the current ones
+            if self.training:  # splice the prebuilt PIC prefix onto current query K/V
                 layer = past_key_values.layers[self.layer_idx]
                 key_cache, value_cache = layer.keys, layer.values
                 key_states = torch.cat([key_cache, key_states], dim=2)
@@ -274,40 +297,22 @@ class Qwen3Attention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    def forward_with_gist(
+    def forward_with_pic(
         self,
         hidden_states: torch.Tensor,
-        gist_mask: torch.BoolTensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
-        gist_num = gist_mask.shape[1]
-        gist_hidden_states = hidden_states[:, -gist_num:]
-        gist_hidden_shape = (input_shape[0], gist_num, -1, self.head_dim)
-        hidden_states = hidden_states[:, :-gist_num]
-        hidden_shape = (input_shape[0], input_shape[1] - gist_num, -1, self.head_dim)
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states, key_states, value_states = self._project_qkv(hidden_states, use_pic=True)
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
 
-        gist_hidden_states = self.apply_gist_residual(hidden_states, gist_hidden_states, **kwargs)
-
-        # qkv states
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        gist_query_states = self.q_norm(self.gist_q_proj(gist_hidden_states).view(gist_hidden_shape)).transpose(1, 2)
-        gist_key_states = self.k_norm(self.gist_k_proj(gist_hidden_states).view(gist_hidden_shape)).transpose(1, 2)
-        gist_value_states = self.gist_v_proj(gist_hidden_states).view(gist_hidden_shape).transpose(1, 2)
-
-        # copy gist states to query, key, value
-        query_states = torch.cat([query_states, gist_query_states], dim=2)
-        key_states = torch.cat([key_states, gist_key_states], dim=2)
-        value_states = torch.cat([value_states, gist_value_states], dim=2)
-
-        # save gist key value states before reshaping and RoPE
-        gist_key_values = (gist_key_states, gist_value_states)
+        # Keys stay position independent until documents are concatenated.
+        unrotated_key_values = (key_states, value_states)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -325,13 +330,12 @@ class Qwen3Attention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,  # diff with Llama
-            kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
             **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, gist_key_values
+        return attn_output, unrotated_key_values
 
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
@@ -376,10 +380,9 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
-    def forward_with_gist(
+    def forward_with_pic(
         self,
         hidden_states: torch.Tensor,
-        gist_mask: torch.BoolTensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -387,9 +390,8 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, gist_key_values = self.self_attn.forward_with_gist(
+        hidden_states, pic_key_values = self.self_attn.forward_with_pic(
             hidden_states=hidden_states,
-            gist_mask=gist_mask,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -401,7 +403,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states, gist_key_values
+        return hidden_states, pic_key_values
 
 
 @auto_docstring
@@ -438,13 +440,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        # gist token embedding
-        self.gist_embed_tokens = nn.Embedding(config.gist_extra_embed_num, config.hidden_size, self.padding_idx)
-        self.gist_embed_tokens._is_hf_initialized = True
-        assert config.gist_token_id is not None, "Make sure gist_token_id is set in the config"
-        self.gist_token_id = config.gist_token_id
-        self.prepare_gist_input = get_prepare_gist_input_func(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -514,63 +509,55 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
         )
 
-    def generate_gist(
+    def generate_pic(
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.BoolTensor,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Tuple[BaseModelOutputWithPast, torch.Tensor, torch.Tensor]:
-        attention_mask, gist_mask, position_ids = self.prepare_gist_input(
-            input_ids, attention_mask, **kwargs
-        )
-        gist_embed = self.gist_embed_tokens(input_ids.new_zeros((1, 1)).expand(gist_mask.shape))
+    ) -> Tuple[BaseModelOutputWithPast, torch.Tensor]:
+        """Encode each row independently and return full, unrotated K/V states."""
+        if not self.config.pic_enabled:
+            raise ValueError("generate_pic requires pic_enabled=True")
+        attention_mask = attention_mask.bool()
+        position_ids = attention_mask.long().cumsum(dim=1) - 1
+        position_ids.masked_fill_(~attention_mask, 0)
         inputs_embeds = self.embed_tokens(input_ids)
-        inputs_embeds = torch.cat([inputs_embeds, gist_embed], dim=1)
-
         hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        attention_mask = create_causal_mask(
+        causal_mask = create_causal_mask(
             self.config, inputs_embeds, attention_mask, past_key_values=None, position_ids=position_ids
         )
-
-        gist_key_values = []
-        if self.training and GIST_GRADIENT_CHECKPOINTING:
-            # use_reentrant=True is required for DeepSpeed ZeRO-3 compatibility:
-            # use_reentrant=False bypasses DeepSpeed's parameter-gathering hooks
-            # and causes shape mismatches on partitioned parameters.
+        pic_key_values = []
+        if self.training and pic_utils.PIC_GRADIENT_CHECKPOINTING:
             cos, sin = position_embeddings
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                 def _make_ckpt_fn(layer):
                     def _fn(hs):
-                        hs, (gk, gv) = layer.forward_with_gist(
-                            hs, gist_mask, attention_mask, (cos, sin), **kwargs
+                        hs, (key, value) = layer.forward_with_pic(
+                            hs, causal_mask, (cos, sin), **kwargs
                         )
-                        return hs, gk, gv
+                        return hs, key, value
                     return _fn
-                hidden_states, gist_k, gist_v = torch.utils.checkpoint.checkpoint(
+                hidden_states, pic_key, pic_value = torch.utils.checkpoint.checkpoint(
                     _make_ckpt_fn(decoder_layer), hidden_states,
                     use_reentrant=True,
                 )
-                gist_key_values.append((gist_k, gist_v))
+                pic_key_values.append((pic_key, pic_value))
         else:
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-                hidden_states, gist_layer_kv = decoder_layer.forward_with_gist(
+                hidden_states, layer_key_values = decoder_layer.forward_with_pic(
                     hidden_states,
-                    gist_mask,
-                    attention_mask,
+                    causal_mask,
                     position_embeddings,
                     **kwargs,
                 )
-                gist_key_values.append(gist_layer_kv)
+                pic_key_values.append(layer_key_values)
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=tuple(gist_key_values),
-        ), gist_mask, position_ids[:, -gist_mask.shape[1]:].contiguous()
+            past_key_values=tuple(pic_key_values),
+        ), position_ids
 
 
 @auto_docstring
@@ -602,36 +589,30 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         system_input_ids: torch.LongTensor | None = None, # make trainer compatible
         context_input_ids: Optional[Union[List[torch.LongTensor], torch.LongTensor]] = None,
-        use_gist: Optional[bool] = None,
-        reconstruct_loss_coef: Optional[float] = None,
+        use_pic: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
         system_input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            System input ids for generating gist.
+            System input ids accepted by the multi-document trainer.
 
         context_input_ids (`torch.LongTensor` of shape `(batch_size, chunk_num, sequence_length)`, *optional*):
-            List of input ids for generating gist.
+            Independently encoded context documents used to build the PIC prefix.
 
-        use_gist (`bool`, *optional*):
-            Whether to use gist.
-
-        reconstruct_loss_coef (`float`, *optional*):
-            The coefficient of reconstruction loss.
+        use_pic (`bool`, *optional*):
+            Add the learned residual QKV projections for PIC tokens.
         """
-        # Generate gist (only used in training)
-        kwargs['use_gist'] = False if use_gist is None else use_gist
+        kwargs['use_pic'] = False if use_pic is None else use_pic
         past_attention_mask = kwargs.pop("past_attention_mask", None)
-        reconstruct_loss = None
         if context_input_ids is not None:
-            reconstruct_kwargs = None
-            if labels is not None and reconstruct_loss_coef is not None:
-                reconstruct_kwargs = {"lm_head": self.lm_head, "loss_function": self.loss_function}
-            past_key_values, attention_mask, reconstruct_loss = process_context_input_ids(
-                self.model, context_input_ids, past_key_values, attention_mask, position_ids,
-                reconstruct_kwargs, past_attention_mask,
+            past_key_values, attention_mask = process_context_input_ids(
+                self.model,
+                context_input_ids,
+                past_key_values,
+                attention_mask,
+                past_attention_mask,
             )
-            kwargs['use_gist'] = True
+            kwargs['use_pic'] = True
 
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -651,31 +632,24 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            if reconstruct_loss is not None:
-                loss = loss + reconstruct_loss * reconstruct_loss_coef
 
-        return GistModelOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            reconstruct_loss=reconstruct_loss,
         )
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        """Override the default from_pretrained to initialize gist modules."""
+        """Load base Qwen3 weights while zero-initializing new residual branches."""
         kwargs.update(output_loading_info=True)
         model, loading_info = super().from_pretrained(*args, **kwargs)
 
         missing_keys = loading_info["missing_keys"]
-        # NOTE: the gist parameters may or may not be loaded from the checkpoint
-        # if it is loaded from the checkpoint, we should not re-initilize it
-        init_gist_embed(model.model, missing_keys)
-        # initialize weights of possible q,k,v,o,mlp
         for layer in model.model.layers:
-            init_gist_proj(layer.self_attn, missing_keys)
+            init_missing_residual_projections(layer.self_attn, missing_keys)
 
         return model
 

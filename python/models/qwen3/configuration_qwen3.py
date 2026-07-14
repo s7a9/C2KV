@@ -17,13 +17,10 @@
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from ..gist_utils import GistConfigMixin
-
-
 logger = logging.get_logger(__name__)
 
 
-class Qwen3Config(PretrainedConfig, GistConfigMixin):
+class Qwen3Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -139,9 +136,9 @@ class Qwen3Config(PretrainedConfig, GistConfigMixin):
 
     # Default tensor parallel plan for base model `Qwen3`
     base_model_tp_plan = {
-        "layers.*.self_attn.gist_q_proj": "colwise",
-        "layers.*.self_attn.gist_k_proj": "colwise",
-        "layers.*.self_attn.gist_v_proj": "colwise",
+        "layers.*.self_attn.residual_q_proj": "colwise",
+        "layers.*.self_attn.residual_k_proj": "colwise",
+        "layers.*.self_attn.residual_v_proj": "colwise",
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
         "layers.*.self_attn.v_proj": "colwise",
@@ -151,7 +148,6 @@ class Qwen3Config(PretrainedConfig, GistConfigMixin):
         "layers.*.mlp.down_proj": "rowwise",
     }
     base_model_pp_plan = {
-        "gist_embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
@@ -181,6 +177,8 @@ class Qwen3Config(PretrainedConfig, GistConfigMixin):
         layer_types=None,
         attention_dropout=0.0,
         pad_token_id=None,
+        pic_enabled=False,
+        pic_param="qkv",
         **kwargs,
     ):
         # transformers 5.x removed pad_token_id as a default attribute on PreTrainedConfig;
@@ -210,6 +208,10 @@ class Qwen3Config(PretrainedConfig, GistConfigMixin):
         self.rope_parameters = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.pic_enabled = pic_enabled
+        self.pic_param = pic_param.lower()
+        if not self.pic_param or set(self.pic_param) - set("qkv"):
+            raise ValueError(f"pic_param must be a non-empty combination of q, k, v; got {pic_param!r}")
         self.standardize_rope_params()
         self.validate_rope()
 
