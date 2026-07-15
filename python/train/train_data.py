@@ -705,7 +705,7 @@ class MultiDocDataset(GistDataset):
             batched=False,
             num_proc=64,
             remove_columns=data.column_names
-        )
+        ).filter(lambda sample: any(token_id != -100 for token_id in sample['context_input_ids']), num_proc=64)
         self.max_doc_length = max_doc_length
         self.max_system_length = max_system_length
         self.max_doc_num = max_doc_num

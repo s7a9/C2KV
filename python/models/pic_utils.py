@@ -135,7 +135,8 @@ def build_pic_cache(
     context_lengths = document_mask.sum(dim=(1, 2))
     packed_length = int(context_lengths.max().item())
     if packed_length == 0:
-        raise ValueError("Each batch must contain at least one non-empty context document")
+        raise ValueError(f"Each batch must contain at least one non-empty context document"
+                         f" (got {context_input_ids})")
 
     past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
     if past_attention_mask is None:

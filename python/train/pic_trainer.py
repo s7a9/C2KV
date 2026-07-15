@@ -62,6 +62,7 @@ class PICMultiDocTrainer(Trainer):
         inputs['context_input_ids'] = inputs['context_input_ids'].reshape(
             batch_size, -1, self.max_doc_length
         )
+        assert context_mask.any(dim=1).all(), f"context_input_ids must contain at least one non-empty document, {inputs}"
         inputs['past_key_values'] = system_kv
         inputs['past_attention_mask'] = system_mask
 
