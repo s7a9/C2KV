@@ -86,18 +86,18 @@ def response_to_prediction(response_json: Dict[str, Any]) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         warnings.warn(f"malformed chat completion response: {exc}")
         return ""
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        return json.dumps(tool_calls, ensure_ascii=False)
     content = message.get("content")
-    if isinstance(content, str):
+    if isinstance(content, str) and content:
         return content
-    if content is not None:
+    if content is not None and not isinstance(content, str):
         warnings.warn(
             f"chat completion returned non-string content ({type(content).__name__}); using empty prediction"
         )
         return ""
-    tool_calls = message.get("tool_calls")
-    if tool_calls is not None:
-        return json.dumps(tool_calls, ensure_ascii=False)
-    return ""
+    return content if isinstance(content, str) else ""
 
 
 def parse_token_range(value: Optional[str]) -> Optional[Tuple[Optional[int], Optional[int]]]:

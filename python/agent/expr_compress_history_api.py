@@ -10,7 +10,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -45,6 +45,301 @@ else:
 REUSE_PATTERNS = ("forward", "random")
 REUSE_RATIOS = (1.0, 0.75, 0.5, 0.25)
 DROP_RATIOS = (0.75, 0.5, 0.25)
+
+
+ResultKey = Tuple[Any, ...]
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, list):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_compatible(item) for key, item in value.items()}
+    return value
+
+
+def evaluation_parameters(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return the parameters that determine selection or generated records."""
+    dataset_path = str(Path(args.dataset_path).expanduser().resolve())
+    tokenizer = args.tokenizer
+    if tokenizer is not None:
+        tokenizer = str(Path(tokenizer).expanduser().resolve())
+    return _json_compatible(
+        {
+            "base_url": args.base_url.rstrip("/"),
+            "model": args.model,
+            "tokenizer": tokenizer,
+            "dataset": args.dataset,
+            "dataset_path": dataset_path,
+            "max_examples": args.max_examples,
+            "max_samples": args.max_samples,
+            "max_samples_per_trace": args.max_samples_per_trace,
+            "max_tools": args.max_tools,
+            "benchmark": args.benchmark,
+            "history_message_range": args.history_message_range,
+            "request_token_range": args.request_token_range,
+            "max_new_tokens": args.max_new_tokens,
+            "compression_ratio": args.compression_ratio,
+            "reuse_patterns": args.reuse_patterns,
+            "reuse_ratios": args.reuse_ratios,
+            "random_trials": args.random_trials,
+            "include_no_reuse": args.include_no_reuse,
+            "include_drop_prefix": args.include_drop_prefix,
+            "drop_ratios": args.drop_ratios,
+            "seed": args.seed,
+            "reuse_cache_size": args.reuse_cache_size,
+            "temperature": args.temperature,
+            "profile": args.profile,
+            "save_inputs": args.save_inputs,
+        }
+    )
+
+
+def _legacy_summary_parameters(summary: Dict[str, Any]) -> Dict[str, Any]:
+    legacy_keys = (
+        "base_url",
+        "compression_ratio",
+        "reuse_cache_size",
+        "history_message_range",
+        "request_token_range",
+        "reuse_patterns",
+        "reuse_ratios",
+        "random_trials",
+        "include_no_reuse",
+        "include_drop_prefix",
+        "drop_ratios",
+    )
+    parameters = {
+        key: summary[key]
+        for key in legacy_keys
+        if key in summary
+    }
+    if "model" in summary:
+        parameters["model"] = summary["model"]
+    return parameters
+
+
+def _parameter_differences(
+    summary: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> List[str]:
+    if summary is None:
+        return ["summary 文件不存在或无法读取"]
+    saved = summary.get("parameters")
+    if isinstance(saved, dict):
+        keys = sorted(set(saved) | set(current))
+    else:
+        saved = _legacy_summary_parameters(summary)
+        if not saved:
+            return ["summary 中没有可比较的参数"]
+        keys = sorted(saved)
+    return [
+        f"{key}: 已保存={saved.get(key)!r}, 当前={current.get(key)!r}"
+        for key in keys
+        if saved.get(key) != current.get(key)
+    ]
+
+
+def _prompt_existing_output(output_path: Path, parameters_match: bool) -> str:
+    if parameters_match:
+        prompt = (
+            f"输出文件 {output_path} 已存在且参数一致，"
+            "请选择 [o]覆盖 / [c]继续 / [e]退出: "
+        )
+        choices = {
+            "o": "overwrite",
+            "overwrite": "overwrite",
+            "覆盖": "overwrite",
+            "c": "continue",
+            "continue": "continue",
+            "继续": "continue",
+            "e": "exit",
+            "exit": "exit",
+            "退出": "exit",
+        }
+    else:
+        prompt = (
+            f"输出文件 {output_path} 已存在但参数不一致，"
+            "请选择 [o]覆盖 / [e]退出: "
+        )
+        choices = {
+            "o": "overwrite",
+            "overwrite": "overwrite",
+            "覆盖": "overwrite",
+            "e": "exit",
+            "exit": "exit",
+            "退出": "exit",
+        }
+
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except EOFError:
+            print("未收到选择，退出以避免覆盖已有结果。")
+            return "exit"
+        if choice in choices:
+            return choices[choice]
+        print("无效选择，请重新输入。")
+
+
+def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        warnings.warn(f"无法读取 summary {path}: {exc}")
+        return None
+    if not isinstance(value, dict):
+        warnings.warn(f"summary {path} 的顶层不是 JSON 对象")
+        return None
+    return value
+
+
+def _load_result_records(path: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"无法解析 {path} 第 {line_number} 行: {exc}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"{path} 第 {line_number} 行不是 JSON 对象")
+            records.append(record)
+    return records
+
+
+def prepare_existing_output(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if not args.output_file:
+        return []
+    output_path = Path(args.output_file)
+    if not output_path.exists():
+        return []
+
+    summary_path = output_path.with_name(f"{output_path.stem}_summary.json")
+    differences = _parameter_differences(
+        _load_json_file(summary_path) if summary_path.exists() else None,
+        evaluation_parameters(args),
+    )
+    if differences:
+        print("检测到以下参数差异:")
+        for difference in differences:
+            print(f"  - {difference}")
+    action = _prompt_existing_output(output_path, not differences)
+    if action == "exit":
+        raise SystemExit(0)
+    if action == "overwrite":
+        return []
+
+    records = _load_result_records(output_path)
+    completed = sum(bool(record.get("prediction")) for record in records)
+    empty = len(records) - completed
+    print(
+        f"已读取 {len(records)} 条已有结果，其中 {completed} 条可跳过，"
+        f"{empty} 条 prediction 为空、需要重测。"
+    )
+    return records
+
+
+def result_key(record: Dict[str, Any]) -> Optional[ResultKey]:
+    qid = record.get("qid")
+    experiment_type = record.get("experiment_type")
+    if qid is None or experiment_type is None:
+        return None
+    if experiment_type == "no_reuse":
+        return (qid, experiment_type)
+    if experiment_type == "drop_prefix":
+        return (qid, experiment_type, record.get("drop_ratio"))
+    if experiment_type == "mixed_reuse":
+        return (
+            qid,
+            experiment_type,
+            record.get("reuse_pattern"),
+            record.get("reuse_ratio"),
+            record.get("random_trial"),
+        )
+    return None
+
+
+def completed_result_keys(records: Sequence[Dict[str, Any]]) -> Set[ResultKey]:
+    nonempty_keys = {
+        key
+        for record in records
+        if record.get("prediction") and (key := result_key(record)) is not None
+    }
+    empty_keys = {
+        key
+        for record in records
+        if not record.get("prediction") and (key := result_key(record)) is not None
+    }
+    return nonempty_keys - empty_keys
+
+
+def merge_results(
+    existing_records: Sequence[Dict[str, Any]],
+    new_records: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    replaced_keys = {
+        key
+        for record in new_records
+        if (key := result_key(record)) is not None
+    }
+    return [
+        record
+        for record in existing_records
+        if result_key(record) not in replaced_keys
+    ] + list(new_records)
+
+
+def _run_key(
+    qid: str,
+    experiment_type: str,
+    *,
+    pattern: Optional[str] = None,
+    ratio: Optional[float] = None,
+    trial: Optional[int] = None,
+) -> ResultKey:
+    if experiment_type == "no_reuse":
+        return (qid, experiment_type)
+    if experiment_type == "drop_prefix":
+        return (qid, experiment_type, ratio)
+    return (qid, experiment_type, pattern, ratio, trial)
+
+
+def pending_run_count(
+    example: AgentExample,
+    args: argparse.Namespace,
+    completed_keys: Set[ResultKey],
+) -> int:
+    count = 0
+    if args.include_no_reuse:
+        count += _run_key(example.qid, "no_reuse") not in completed_keys
+    if args.include_drop_prefix:
+        count += sum(
+            _run_key(example.qid, "drop_prefix", ratio=ratio) not in completed_keys
+            for ratio in args.drop_ratios
+        )
+    for pattern in args.reuse_patterns:
+        trials = args.random_trials if pattern == "random" else 1
+        count += sum(
+            _run_key(
+                example.qid,
+                "mixed_reuse",
+                pattern=pattern,
+                ratio=ratio,
+                trial=trial if pattern == "random" else None,
+            )
+            not in completed_keys
+            for ratio in args.reuse_ratios
+            for trial in range(trials)
+        )
+    return count
 
 
 def chat_completion(
@@ -649,7 +944,11 @@ def _process_example(
     args: argparse.Namespace,
     history_cache: Dict[Tuple[str, str], str],
     cache_lock: Lock,
+    completed_keys: Set[ResultKey],
 ) -> Tuple[int, List[Dict[str, Any]], float, float]:
+    if pending_run_count(example, args, completed_keys) == 0:
+        return output_index, [], 0.0, 0.0
+
     base_url = args.base_url.rstrip("/")
     extracted_history, extract_time = extract_history_once(
         example,
@@ -664,7 +963,8 @@ def _process_example(
     records: List[Dict[str, Any]] = []
     chat_time = 0.0
     reusable_history_tokens = sum(history_token_lengths)
-    if args.include_no_reuse:
+    no_reuse_key = _run_key(example.qid, "no_reuse")
+    if args.include_no_reuse and no_reuse_key not in completed_keys:
         messages = build_chat_messages(
             example,
             extracted_history,
@@ -736,6 +1036,13 @@ def _process_example(
 
     if args.include_drop_prefix:
         for drop_ratio in args.drop_ratios:
+            drop_prefix_key = _run_key(
+                example.qid,
+                "drop_prefix",
+                ratio=drop_ratio,
+            )
+            if drop_prefix_key in completed_keys:
+                continue
             messages, dropped_indices, kept_indices = build_drop_prefix_messages(
                 example,
                 extracted_history,
@@ -811,6 +1118,15 @@ def _process_example(
         trials = args.random_trials if pattern == "random" else 1
         for ratio in args.reuse_ratios:
             for trial in range(trials):
+                mixed_reuse_key = _run_key(
+                    example.qid,
+                    "mixed_reuse",
+                    pattern=pattern,
+                    ratio=ratio,
+                    trial=trial if pattern == "random" else None,
+                )
+                if mixed_reuse_key in completed_keys:
+                    continue
                 rng = random.Random(f"{args.seed}:{example.qid}:{pattern}:{ratio}:{trial}")
                 reuse_indices = select_reuse_indices(
                     len(extracted_history),
@@ -936,7 +1252,11 @@ def _min_messages_from_history_range(
     return low + 1
 
 
-def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
+def evaluate(
+    args: argparse.Namespace,
+    dataset: AgentDataset,
+    existing_results: Sequence[Dict[str, Any]] = (),
+) -> Dict[str, Any]:
     tokenizer_name = args.tokenizer or args.model
     if tokenizer_name == "default":
         raise ValueError(
@@ -970,6 +1290,15 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
     args.dataset_obj = dataset
     history_cache: Dict[Tuple[str, str], str] = {}
     cache_lock = Lock()
+    completed_keys = completed_result_keys(existing_results)
+    pending_runs = [
+        pending_run_count(example, args, completed_keys)
+        for example, _, _ in selected
+    ]
+    scheduled_runs = sum(pending_runs)
+    skipped_runs = total * total_runs - scheduled_runs
+    if existing_results:
+        print(f"续测将跳过 {skipped_runs} 个已有结果，执行 {scheduled_runs} 个测试。")
     results_by_example: List[Optional[List[Dict[str, Any]]]] = [None] * total
     extract_times: List[float] = []
     chat_times: List[float] = []
@@ -986,14 +1315,16 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
                 args,
                 history_cache,
                 cache_lock,
+                completed_keys,
             ): output_index
             for output_index, (
                 example,
                 history_token_lengths,
                 request_tokens,
             ) in enumerate(selected)
+            if pending_runs[output_index] > 0
         }
-        with tqdm(total=total * total_runs, desc="Agent compress history API") as progress:
+        with tqdm(total=scheduled_runs, desc="Agent compress history API") as progress:
             for future in as_completed(futures):
                 output_index, records, extract_time, chat_time = future.result()
                 results_by_example[output_index] = records
@@ -1002,11 +1333,12 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
                     chat_times.append(chat_time)
                 progress.update(len(records))
 
-    final_results = [
+    new_results = [
         record
         for example_records in results_by_example
         for record in (example_records or [])
     ]
+    final_results = merge_results(existing_results, new_results)
     add_behavior_metrics(final_results)
     by_setting: Dict[str, Dict[str, Any]] = {}
     for pattern in args.reuse_patterns:
@@ -1053,6 +1385,7 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
         "num_selected_examples": total,
         "num_runs": len(final_results),
         "by_setting": by_setting,
+        "parameters": evaluation_parameters(args),
     }
     if args.profile and extract_times:
         statistics.update(
@@ -1170,6 +1503,7 @@ def main() -> None:
     args = parse_args()
     if args.random_trials < 1:
         raise ValueError("--random-trials must be >= 1")
+    existing_results = prepare_existing_output(args)
     dataset = load_agent_dataset(
         args.dataset,
         args.dataset_path,
@@ -1181,7 +1515,7 @@ def main() -> None:
         benchmark=args.benchmark,
     )
     print(f"Loaded {len(dataset)} examples from {args.dataset}")
-    summary = evaluate(args, dataset)
+    summary = evaluate(args, dataset, existing_results)
     if "tool_call_accuracy" in summary:
         print(f"\nTool-call accuracy: {summary['tool_call_accuracy']:.4f}")
         print(f"Soft tool score: {summary['soft_tool_score']:.4f}")
