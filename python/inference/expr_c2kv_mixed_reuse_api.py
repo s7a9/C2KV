@@ -67,8 +67,8 @@ def extract_documents_once(
         doc_message: Dict[str, Any] = {"role": "user", "content": doc}
         try:
             result = extract_document(base_url, doc, compression_ratio, role="user")
-            if result.get("success") and result.get("key_hash"):
-                doc_message["c2kv_key_hash"] = result["key_hash"]
+            if result.get("success"):
+                doc_message["c2kv_extracted"] = True
             else:
                 warnings.warn(f"[{example['qid']}] extract failed: {result.get('error')}")
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
@@ -82,6 +82,7 @@ def build_mixed_messages(
     doc_messages: Sequence[Dict[str, Any]],
     question: str,
     reuse_indices: Sequence[int],
+    c2kv_reuse: str,
 ) -> List[Dict[str, Any]]:
     reuse_index_set = set(reuse_indices)
     messages: List[Dict[str, Any]] = []
@@ -92,8 +93,8 @@ def build_mixed_messages(
             "role": doc_message["role"],
             "content": doc_message["content"],
         }
-        if index in reuse_index_set and doc_message.get("c2kv_key_hash"):
-            mixed_message["c2kv_key_hash"] = doc_message["c2kv_key_hash"]
+        if index in reuse_index_set and doc_message.get("c2kv_extracted"):
+            mixed_message["c2kv_reuse"] = c2kv_reuse
         messages.append(mixed_message)
     messages.append({"role": "user", "content": question})
     return messages
@@ -112,6 +113,7 @@ def _process_example(
     reuse_ratios: Sequence[float],
     random_trials: int,
     seed: int,
+    c2kv_reuse: str,
 ) -> List[dict]:
     system_prompt = example.get("system_prompt", default_system_prompt)
     max_new_tokens = example.get("max_new_tokens", default_max_new_tokens)
@@ -130,13 +132,14 @@ def _process_example(
                     doc_messages,
                     example["question"],
                     reuse_indices,
+                    c2kv_reuse,
                 )
                 pred = chat_completion(base_url, model, messages, max_new_tokens)
                 em_score = safe_metric(metric_fn, pred, example["answer"], example["qid"])
                 reused_indices = [
                     index
                     for index in reuse_indices
-                    if doc_messages[index].get("c2kv_key_hash")
+                    if doc_messages[index].get("c2kv_extracted")
                 ]
                 records.append(
                     {
@@ -209,6 +212,7 @@ def evaluate_via_api(args: argparse.Namespace, dataset: AbstractMDQADataset) -> 
                 args.reuse_ratios,
                 args.random_trials,
                 args.seed,
+                args.c2kv_reuse,
             ): i
             for i, example in enumerate(examples)
         }
@@ -258,6 +262,7 @@ def evaluate_via_api(args: argparse.Namespace, dataset: AbstractMDQADataset) -> 
             "num_runs": len(records),
             "exact_match": exact_match,
             "compression_ratio": args.compression_ratio,
+            "c2kv_reuse": args.c2kv_reuse,
             "reuse_patterns": args.reuse_patterns,
             "reuse_ratios": args.reuse_ratios,
             "random_trials": args.random_trials,
@@ -284,6 +289,12 @@ def main():
     parser.add_argument("--cot", action="store_true", default=False)
     parser.add_argument("--cut_length", type=int, default=None)
     parser.add_argument("--compression-ratio", type=int, default=4, dest="compression_ratio")
+    parser.add_argument(
+        "--c2kv-reuse",
+        choices=("required", "best_effort"),
+        default="required",
+        help="Reuse policy placed on successfully extracted text messages (default: required)",
+    )
     parser.add_argument(
         "--reuse-pattern",
         type=_parse_reuse_patterns,

@@ -9,7 +9,6 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -82,6 +81,7 @@ def evaluation_parameters(args: argparse.Namespace) -> Dict[str, Any]:
             "request_token_range": args.request_token_range,
             "max_new_tokens": args.max_new_tokens,
             "compression_ratio": args.compression_ratio,
+            "c2kv_reuse": args.c2kv_reuse,
             "reuse_patterns": args.reuse_patterns,
             "reuse_ratios": args.reuse_ratios,
             "random_trials": args.random_trials,
@@ -89,7 +89,6 @@ def evaluation_parameters(args: argparse.Namespace) -> Dict[str, Any]:
             "include_drop_prefix": args.include_drop_prefix,
             "drop_ratios": args.drop_ratios,
             "seed": args.seed,
-            "reuse_cache_size": args.reuse_cache_size,
             "temperature": args.temperature,
             "profile": args.profile,
             "save_inputs": args.save_inputs,
@@ -462,13 +461,14 @@ def build_chat_messages(
     example: AgentExample,
     extracted_history: Sequence[Dict[str, Any]],
     reuse_indices: Sequence[int],
+    c2kv_reuse: str = "required",
 ) -> List[Dict[str, Any]]:
     messages = protected_chat_prefix(example)
     reuse_index_set = set(reuse_indices)
     for index, message in enumerate(extracted_history):
         chat_message = _history_chat_message(message)
-        if index in reuse_index_set and message.get("c2kv_key_hash"):
-            chat_message["c2kv_key_hash"] = message["c2kv_key_hash"]
+        if index in reuse_index_set and message.get("c2kv_extracted"):
+            chat_message["c2kv_reuse"] = c2kv_reuse
         messages.append(chat_message)
     messages.extend(protected_chat_suffix(example))
     return messages
@@ -499,15 +499,13 @@ def extract_history_once(
     example: AgentExample,
     base_url: str,
     compression_ratio: int,
-    cache: Dict[Tuple[str, str], str],
-    cache_lock: Lock,
-    cache_size: int,
 ) -> Tuple[List[Dict[str, Any]], float]:
     extracted: List[Dict[str, Any]] = []
     total_extract_time = 0.0
     for message in protected_history_messages(example):
-        role = extract_role(message.get("role", "user"))
-        content = str(message.get("content", ""))
+        message_role = message.get("role", "user")
+        role = extract_role(message_role)
+        content = message.get("content", "")
         extracted_message: Dict[str, Any] = {
             "role": message.get("role", role),
             "content": content,
@@ -515,29 +513,24 @@ def extract_history_once(
         for key in ("tool_calls", "tool_call_id", "name"):
             if key in message:
                 extracted_message[key] = message[key]
-        if not content:
+        is_plain_text_message = (
+            message_role in {"system", "user", "assistant"}
+            and isinstance(content, str)
+            and bool(content)
+            and not any(
+                key in message for key in ("tool_calls", "tool_call_id", "name")
+            )
+        )
+        if not is_plain_text_message:
             extracted.append(extracted_message)
             continue
-
-        cache_key = (role, content)
-        with cache_lock:
-            cached_key_hash = cache.get(cache_key)
-            if cached_key_hash is not None:
-                extracted_message["c2kv_key_hash"] = cached_key_hash
-                extracted.append(extracted_message)
-                continue
 
         t0 = time.perf_counter()
         result = extract_segment(base_url, content, compression_ratio, role=role)
         total_extract_time += time.perf_counter() - t0
-        if result.get("success") and result.get("key_hash"):
-            key_hash = result["key_hash"]
-            extracted_message["c2kv_key_hash"] = key_hash
-            if cache_size > 0:
-                with cache_lock:
-                    cache[cache_key] = key_hash
-                    if len(cache) > cache_size:
-                        cache.pop(next(iter(cache)))
+        if result.get("success"):
+            extracted_message["c2kv_extracted"] = True
+            extracted_message["c2kv_diagnostic_key_hash"] = result.get("key_hash")
         else:
             warnings.warn(f"[{example.qid}] history extract failed: {result.get('error')}")
         extracted.append(extracted_message)
@@ -942,8 +935,6 @@ def _process_example(
     history_token_lengths: List[int],
     request_tokens: int,
     args: argparse.Namespace,
-    history_cache: Dict[Tuple[str, str], str],
-    cache_lock: Lock,
     completed_keys: Set[ResultKey],
 ) -> Tuple[int, List[Dict[str, Any]], float, float]:
     if pending_run_count(example, args, completed_keys) == 0:
@@ -954,9 +945,6 @@ def _process_example(
         example,
         base_url,
         args.compression_ratio,
-        history_cache,
-        cache_lock,
-        args.reuse_cache_size,
     )
 
     max_new_tokens = example.max_new_tokens or args.max_new_tokens
@@ -969,6 +957,7 @@ def _process_example(
             example,
             extracted_history,
             reuse_indices=[],
+            c2kv_reuse=args.c2kv_reuse,
         )
         t0 = time.perf_counter()
         response_json = chat_completion(
@@ -1018,7 +1007,7 @@ def _process_example(
                         "role": extract_role(message.get("role", "user")),
                         "content": message.get("content", ""),
                         "compression_ratio": args.compression_ratio,
-                        "key_hash": message.get("c2kv_key_hash"),
+                        "key_hash": message.get("c2kv_diagnostic_key_hash"),
                     }
                     for message in extracted_history
                 ],
@@ -1138,6 +1127,7 @@ def _process_example(
                     example,
                     extracted_history,
                     reuse_indices,
+                    c2kv_reuse=args.c2kv_reuse,
                 )
                 t0 = time.perf_counter()
                 response_json = chat_completion(
@@ -1156,7 +1146,7 @@ def _process_example(
                 reused_indices = [
                     index
                     for index in reuse_indices
-                    if extracted_history[index].get("c2kv_key_hash")
+                    if extracted_history[index].get("c2kv_extracted")
                 ]
                 requested_reuse_tokens = token_sum(reuse_indices, history_token_lengths)
                 reused_tokens = token_sum(reused_indices, history_token_lengths)
@@ -1197,7 +1187,7 @@ def _process_example(
                                 "role": extract_role(message.get("role", "user")),
                                 "content": message.get("content", ""),
                                 "compression_ratio": args.compression_ratio,
-                                "key_hash": message.get("c2kv_key_hash"),
+                                "key_hash": message.get("c2kv_diagnostic_key_hash"),
                             }
                             for message in extracted_history
                         ],
@@ -1288,8 +1278,6 @@ def evaluate(
     )
 
     args.dataset_obj = dataset
-    history_cache: Dict[Tuple[str, str], str] = {}
-    cache_lock = Lock()
     completed_keys = completed_result_keys(existing_results)
     pending_runs = [
         pending_run_count(example, args, completed_keys)
@@ -1313,8 +1301,6 @@ def evaluate(
                 history_token_lengths,
                 request_tokens,
                 args,
-                history_cache,
-                cache_lock,
                 completed_keys,
             ): output_index
             for output_index, (
@@ -1372,7 +1358,7 @@ def evaluate(
     statistics: Dict[str, Any] = {
         "base_url": args.base_url.rstrip("/"),
         "compression_ratio": args.compression_ratio,
-        "reuse_cache_size": args.reuse_cache_size,
+        "c2kv_reuse": args.c2kv_reuse,
         **protected_flags(),
         "history_message_range": args.history_message_range,
         "request_token_range": args.request_token_range,
@@ -1446,6 +1432,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file")
     parser.add_argument("--compression-ratio", type=int, default=2)
     parser.add_argument(
+        "--c2kv-reuse",
+        choices=("required", "best_effort"),
+        default="required",
+        help="Reuse policy placed on successfully extracted text history messages",
+    )
+    parser.add_argument(
         "--reuse-pattern",
         type=_parse_reuse_patterns,
         default=list(REUSE_PATTERNS),
@@ -1478,12 +1470,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated oldest-history drop ratios, default: 0.75,0.5,0.25",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--reuse-cache-size",
-        type=int,
-        default=32,
-        help="Number of distinct history messages to memoize client-side",
-    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--preprocess-workers", type=int, default=4)
     parser.add_argument("--preprocess-chunk-multiplier", type=int, default=8)

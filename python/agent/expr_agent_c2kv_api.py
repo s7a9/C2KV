@@ -7,7 +7,6 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -142,7 +141,7 @@ def token_count_in_range(
 def build_chat_messages(
     example: AgentExample,
     tool_message_content: str,
-    tool_key_hash: Optional[str],
+    c2kv_reuse: Optional[str],
 ) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": example.system_prompt},
@@ -151,8 +150,8 @@ def build_chat_messages(
         "role": "system",
         "content": tool_message_content,
     }
-    if tool_key_hash:
-        tool_message["c2kv_key_hash"] = tool_key_hash
+    if c2kv_reuse:
+        tool_message["c2kv_reuse"] = c2kv_reuse
     messages.append(tool_message)
     messages.extend(example.messages)
     return messages
@@ -188,14 +187,6 @@ def system_message_content(rendered_system_message: str) -> str:
     return rendered_system_message
 
 
-def _cache_put(cache: Dict[str, str], key: str, value: str, capacity: int) -> None:
-    if capacity <= 0:
-        return
-    cache[key] = value
-    if len(cache) > capacity:
-        cache.pop(next(iter(cache)))
-
-
 def _process_example(
     output_index: int,
     total: int,
@@ -204,45 +195,29 @@ def _process_example(
     tool_tokens: int,
     request_tokens: int,
     args: argparse.Namespace,
-    tool_cache: Dict[str, str],
-    cache_lock: Lock,
 ) -> Tuple[int, Dict[str, Any], float, float]:
     base_url = args.base_url.rstrip("/")
-    key_hash = None
     extract_json: Optional[Dict[str, Any]] = None
 
     t0 = time.perf_counter()
-    with cache_lock:
-        cached_key_hash = tool_cache.get(tool_content)
-    if cached_key_hash is not None:
-        key_hash = cached_key_hash
-    else:
-        try:
-            extract_json = extract_segment(
-                base_url,
-                tool_content,
-                args.compression_ratio,
-                role=args.extract_role,
+    try:
+        extract_json = extract_segment(
+            base_url,
+            tool_content,
+            args.compression_ratio,
+            role=args.extract_role,
+        )
+        if not extract_json.get("success"):
+            warnings.warn(
+                f"[{example.qid}] extract failed: "
+                f"{extract_json.get('error') if extract_json else None}"
             )
-            if extract_json.get("success") and extract_json.get("key_hash"):
-                key_hash = extract_json["key_hash"]
-                with cache_lock:
-                    _cache_put(
-                        tool_cache,
-                        tool_content,
-                        key_hash,
-                        args.reuse_cache_size,
-                    )
-            else:
-                warnings.warn(
-                    f"[{example.qid}] extract failed: "
-                    f"{extract_json.get('error') if extract_json else None}"
-                )
-        except requests.RequestException as exc:
-            warnings.warn(f"[{example.qid}] extract error: {exc}")
+    except requests.RequestException as exc:
+        warnings.warn(f"[{example.qid}] extract error: {exc}")
     t_extract = time.perf_counter() - t0
 
-    messages = build_chat_messages(example, tool_content, key_hash)
+    reuse_mode = args.c2kv_reuse if extract_json and extract_json.get("success") else None
+    messages = build_chat_messages(example, tool_content, reuse_mode)
     max_new_tokens = example.max_new_tokens or args.max_new_tokens
 
     t1 = time.perf_counter()
@@ -267,7 +242,7 @@ def _process_example(
         if args.profile
         else None,
     )
-    record["tool_key_hash"] = key_hash
+    record["tool_key_hash"] = extract_json.get("key_hash") if extract_json else None
     record["tool_tokens"] = tool_tokens
     record["request_tokens"] = request_tokens
     if args.save_inputs:
@@ -304,7 +279,7 @@ def _preprocess_example_for_selection(
     if not token_count_in_range(tool_tokens, tool_token_range):
         return None
 
-    chat_messages = build_chat_messages(example, tool_content, tool_key_hash=None)
+    chat_messages = build_chat_messages(example, tool_content, c2kv_reuse=None)
     request_text = render_chat_request_for_count(tokenizer, chat_messages)
     request_tokens = len(tokenizer.encode(request_text, add_special_tokens=False))
     if not token_count_in_range(request_tokens, request_token_range):
@@ -397,8 +372,6 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
     # Keep the dataset available to worker calls without changing public APIs.
     args.dataset_obj = dataset
 
-    tool_cache: Dict[str, str] = {}
-    cache_lock = Lock()
     results: List[Optional[Dict[str, Any]]] = [None] * total
     extract_times: List[float] = []
     chat_times: List[float] = []
@@ -414,8 +387,6 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
                 tool_tokens,
                 request_tokens,
                 args,
-                tool_cache,
-                cache_lock,
             ): output_index
             for output_index, (
                 example,
@@ -437,7 +408,7 @@ def evaluate(args: argparse.Namespace, dataset: AgentDataset) -> Dict[str, Any]:
     statistics: Dict[str, Any] = {
         "base_url": args.base_url.rstrip("/"),
         "compression_ratio": args.compression_ratio,
-        "reuse_cache_size": args.reuse_cache_size,
+        "c2kv_reuse": args.c2kv_reuse,
         "tool_token_range": args.tool_token_range,
         "request_token_range": args.request_token_range,
     }
@@ -516,10 +487,10 @@ def parse_args() -> argparse.Namespace:
         help="Role used by /v1/c2kv/extract for the rendered tool segment",
     )
     parser.add_argument(
-        "--reuse-cache-size",
-        type=int,
-        default=1,
-        help="Number of distinct rendered tool segments to memoize client-side",
+        "--c2kv-reuse",
+        choices=("required", "best_effort"),
+        default="required",
+        help="Reuse policy placed on the successfully extracted tool message",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(

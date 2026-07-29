@@ -5,10 +5,8 @@ import json
 import logging
 import random
 import time
-from collections import OrderedDict
 from copy import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
@@ -16,44 +14,7 @@ import requests
 
 
 JSONDict = Dict[str, Any]
-CacheKey = Tuple[str, str, int]
 LOGGER = logging.getLogger("c2kv_proxy")
-
-
-class LRUCache:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = max(0, capacity)
-        self._lock = Lock()
-        self._items: OrderedDict[CacheKey, str] = OrderedDict()
-
-    def get(self, key: CacheKey) -> Optional[str]:
-        if self.capacity <= 0:
-            return None
-        with self._lock:
-            value = self._items.get(key)
-            if value is None:
-                return None
-            self._items.move_to_end(key)
-            return value
-
-    def put(self, key: CacheKey, value: str) -> None:
-        if self.capacity <= 0:
-            return
-        with self._lock:
-            self._items[key] = value
-            self._items.move_to_end(key)
-            while len(self._items) > self.capacity:
-                self._items.popitem(last=False)
-
-    def clear(self) -> int:
-        with self._lock:
-            size = len(self._items)
-            self._items.clear()
-            return size
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._items)
 
 
 def _parse_roles(value: str) -> set[str]:
@@ -67,13 +28,6 @@ def _message_content(message: JSONDict) -> str:
     if content is None:
         return ""
     return json.dumps(content, ensure_ascii=False, sort_keys=True)
-
-
-def _extract_role(message: JSONDict, override: str) -> str:
-    if override != "auto":
-        return override
-    role = str(message.get("role", "user"))
-    return role if role in {"system", "user", "assistant"} else "user"
 
 
 def _last_user_index(messages: Sequence[JSONDict]) -> Optional[int]:
@@ -105,12 +59,16 @@ def eligible_message_indices(messages: Sequence[JSONDict], args: argparse.Namesp
     for index, message in enumerate(messages):
         if index in protected:
             continue
-        if message.get("c2kv_key_hash"):
+        if message.get("c2kv_reuse"):
             continue
         role = str(message.get("role", ""))
         if role not in eligible_roles:
             continue
-        content = _message_content(message)
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if any(key in message for key in ("tool_calls", "tool_call_id", "name")):
+            continue
         if len(content) < args.min_content_chars:
             continue
         indices.append(index)
@@ -181,7 +139,6 @@ class C2KVProxy:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.upstream_base_url = args.upstream_base_url.rstrip("/")
-        self.cache = LRUCache(args.cache_size)
 
     def rewrite_chat_payload(self, payload: JSONDict) -> Tuple[JSONDict, JSONDict]:
         request_args = self._request_args(payload)
@@ -206,77 +163,66 @@ class C2KVProxy:
             "candidate_messages": len(candidates),
             "protected_messages": len(protected_message_indices(rewritten_messages, request_args)),
             "selected_messages": len(selected),
-            "cache_hits": 0,
             "extract_requests": 0,
             "extract_attempts": 0,
             "extract_failures": 0,
-            "attached_key_hashes": 0,
+            "attached_reuse_markers": 0,
         }
         for index in selected:
             message = rewritten_messages[index]
             if not isinstance(message, dict):
                 continue
             content = _message_content(message)
-            role = _extract_role(message, request_args.extract_role)
-            cache_key = (role, content, request_args.compression_ratio)
-            key_hash = self.cache.get(cache_key)
-            if key_hash is not None:
-                stats["cache_hits"] += 1
-            else:
-                stats["extract_requests"] += 1
-                try:
-                    result, attempts = post_extract(
-                        self.upstream_base_url,
-                        content,
-                        role,
-                        request_args.compression_ratio,
-                        request_args.request_timeout,
-                        request_args.extract_retries,
-                        request_args.extract_retry_interval,
-                    )
-                    stats["extract_attempts"] += attempts
-                    key_hash = result.get("key_hash") if result.get("success") else None
-                    if key_hash:
-                        self.cache.put(cache_key, key_hash)
-                    else:
-                        stats["extract_failures"] += 1
-                        continue
-                except requests.RequestException:
-                    stats["extract_attempts"] += request_args.extract_retries + 1
+            role = str(message["role"])
+            stats["extract_requests"] += 1
+            try:
+                result, attempts = post_extract(
+                    self.upstream_base_url,
+                    content,
+                    role,
+                    request_args.compression_ratio,
+                    request_args.request_timeout,
+                    request_args.extract_retries,
+                    request_args.extract_retry_interval,
+                )
+                stats["extract_attempts"] += attempts
+                if not result.get("success"):
                     stats["extract_failures"] += 1
-                    LOGGER.exception(
-                        "extract failed index=%s role=%s chars=%s retries=%s",
-                        index,
-                        role,
-                        len(content),
-                        request_args.extract_retries,
-                    )
                     continue
-            message["c2kv_key_hash"] = key_hash
-            stats["attached_key_hashes"] += 1
+            except requests.RequestException:
+                stats["extract_attempts"] += request_args.extract_retries + 1
+                stats["extract_failures"] += 1
+                LOGGER.exception(
+                    "extract failed index=%s role=%s chars=%s retries=%s",
+                    index,
+                    role,
+                    len(content),
+                    request_args.extract_retries,
+                )
+                continue
+            message["c2kv_reuse"] = request_args.c2kv_reuse
+            stats["attached_reuse_markers"] += 1
 
         if request_args.strip_proxy_fields:
             rewritten.pop("c2kv_proxy", None)
-        stats["cache_size"] = len(self.cache)
         stats["reuse_pattern"] = request_args.reuse_pattern
         stats["reuse_ratio"] = request_args.reuse_ratio
+        stats["c2kv_reuse"] = request_args.c2kv_reuse
         stats["compression_ratio"] = request_args.compression_ratio
         LOGGER.info(
             "rewrite chat model=%s messages=%s candidates=%s protected=%s "
-            "selected=%s attached=%s cache_hits=%s extract_requests=%s "
-            "extract_attempts=%s extract_failures=%s cache_size=%s "
+            "selected=%s attached=%s extract_requests=%s "
+            "extract_attempts=%s extract_failures=%s "
             "pattern=%s ratio=%s compression=%s",
             rewritten.get("model"),
             len(rewritten_messages),
             stats["candidate_messages"],
             stats["protected_messages"],
             stats["selected_messages"],
-            stats["attached_key_hashes"],
-            stats["cache_hits"],
+            stats["attached_reuse_markers"],
             stats["extract_requests"],
             stats["extract_attempts"],
             stats["extract_failures"],
-            stats["cache_size"],
             stats["reuse_pattern"],
             stats["reuse_ratio"],
             stats["compression_ratio"],
@@ -291,9 +237,9 @@ class C2KVProxy:
         for key in (
             "reuse_pattern",
             "reuse_ratio",
+            "c2kv_reuse",
             "compression_ratio",
             "eligible_roles",
-            "extract_role",
             "preserve_last_user",
             "protect_prefix_messages",
             "protect_suffix_messages",
@@ -305,8 +251,15 @@ class C2KVProxy:
                 setattr(request_args, key, overrides[key])
         if request_args.reuse_pattern not in {"none", "all", "forward", "random"}:
             raise ValueError("c2kv_proxy.reuse_pattern must be one of none/all/forward/random")
-        if request_args.extract_role not in {"auto", "system", "user", "assistant"}:
-            raise ValueError("c2kv_proxy.extract_role must be one of auto/system/user/assistant")
+        if request_args.c2kv_reuse not in {"required", "best_effort"}:
+            raise ValueError("c2kv_proxy.c2kv_reuse must be required or best_effort")
+        eligible_roles = _parse_roles(request_args.eligible_roles)
+        unsupported_roles = eligible_roles - {"system", "user", "assistant"}
+        if unsupported_roles:
+            raise ValueError(
+                "c2kv_proxy.eligible_roles only supports system/user/assistant; "
+                f"got {','.join(sorted(unsupported_roles))}"
+            )
         if request_args.reuse_ratio <= 0 or request_args.reuse_ratio > 1:
             raise ValueError("c2kv_proxy.reuse_ratio must be in (0, 1]")
         if request_args.compression_ratio < 1:
@@ -330,9 +283,7 @@ class C2KVProxy:
         return requests.get(url, timeout=self.args.request_timeout)
 
     def clear_cache(self) -> JSONDict:
-        cleared = self.cache.clear()
-        LOGGER.info("cleared proxy cache entries=%s", cleared)
-        return {"status": "ok", "cleared_entries": cleared, "cache_size": len(self.cache)}
+        return {"status": "ok", "cleared_entries": 0, "cache_size": 0}
 
 
 def make_handler(proxy: C2KVProxy) -> type[BaseHTTPRequestHandler]:
@@ -369,7 +320,7 @@ def make_handler(proxy: C2KVProxy) -> type[BaseHTTPRequestHandler]:
                     {
                         "status": "ok",
                         "upstream_base_url": proxy.upstream_base_url,
-                        "cache_size": len(proxy.cache),
+                        "cache_size": 0,
                     },
                 )
                 return
@@ -463,6 +414,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upstream-base-url", default="http://localhost:30000")
     parser.add_argument("--compression-ratio", type=int, default=4)
     parser.add_argument(
+        "--c2kv-reuse",
+        choices=["required", "best_effort"],
+        default="best_effort",
+        help="Reuse policy attached after successful prewarming.",
+    )
+    parser.add_argument(
         "--reuse-pattern",
         choices=["none", "all", "forward", "random"],
         default="all",
@@ -476,14 +433,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eligible-roles",
-        default="user,assistant,tool",
+        default="user,assistant",
         help="Comma-separated message roles eligible for C2KV extraction.",
-    )
-    parser.add_argument(
-        "--extract-role",
-        choices=["auto", "system", "user", "assistant"],
-        default="auto",
-        help="Role sent to /v1/c2kv/extract. auto maps tool/unknown roles to user.",
     )
     parser.add_argument(
         "--preserve-last-user",
@@ -504,7 +455,6 @@ def parse_args() -> argparse.Namespace:
         help="Always leave the last N messages unextracted.",
     )
     parser.add_argument("--min-content-chars", type=int, default=1)
-    parser.add_argument("--cache-size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument(
@@ -555,6 +505,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--extract-retries must be >= 0")
     if args.extract_retry_interval < 0:
         raise ValueError("--extract-retry-interval must be >= 0")
+    unsupported_roles = _parse_roles(args.eligible_roles) - {
+        "system",
+        "user",
+        "assistant",
+    }
+    if unsupported_roles:
+        raise ValueError(
+            "--eligible-roles only supports system,user,assistant; "
+            f"got {','.join(sorted(unsupported_roles))}"
+        )
     return args
 
 
@@ -582,14 +542,14 @@ def main() -> None:
     )
     LOGGER.info(
         "C2KV proxy listening host=%s port=%s upstream=%s reuse_pattern=%s "
-        "reuse_ratio=%s cache_size=%s protect_prefix=%s protect_suffix=%s "
+        "reuse_ratio=%s c2kv_reuse=%s protect_prefix=%s protect_suffix=%s "
         "extract_retries=%s",
         args.listen_host,
         args.listen_port,
         args.upstream_base_url.rstrip("/"),
         args.reuse_pattern,
         args.reuse_ratio,
-        args.cache_size,
+        args.c2kv_reuse,
         args.protect_prefix_messages,
         args.protect_suffix_messages,
         args.extract_retries,

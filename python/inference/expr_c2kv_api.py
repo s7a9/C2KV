@@ -84,6 +84,7 @@ def _process_example(
     model: str,
     cut_length: int | None,
     compression_ratio: int,
+    c2kv_reuse: str,
     default_max_new_tokens: int,
     profile: bool,
     default_system_prompt: str | None,
@@ -99,8 +100,14 @@ def _process_example(
     for doc in documents:
         try:
             result = extract_document(base_url, doc, compression_ratio, role="user")
-            if result.get("success") and result.get("key_hash"):
-                doc_messages.append({"role": "user", "content": doc, "c2kv_key_hash": result["key_hash"]})
+            if result.get("success"):
+                doc_messages.append(
+                    {
+                        "role": "user",
+                        "content": doc,
+                        "c2kv_reuse": c2kv_reuse,
+                    }
+                )
             else:
                 warnings.warn(f"[{example['qid']}] extract failed: {result.get('error')}")
                 doc_messages.append({"role": "user", "content": doc})
@@ -161,7 +168,7 @@ def evaluate_via_api(args: argparse.Namespace, dataset: AbstractMDQADataset) -> 
             executor.submit(
                 _process_example,
                 example,
-                base_url, model, cut_length, compression_ratio,
+                base_url, model, cut_length, compression_ratio, args.c2kv_reuse,
                 default_max_new_tokens, profile, default_system_prompt,
                 dataset.metric,
             ): i
@@ -193,6 +200,7 @@ def evaluate_via_api(args: argparse.Namespace, dataset: AbstractMDQADataset) -> 
             'num_examples': len(records),
             'exact_match': exact_match,
             'compression_ratio': compression_ratio,
+            'c2kv_reuse': args.c2kv_reuse,
         }
         if profile and extract_times:
             summary['extract_mean'] = round(float(np.mean(extract_times)), 4)
@@ -230,6 +238,12 @@ def main():
                         help="Cut documents to at most this many characters")
     parser.add_argument("--compression-ratio", type=int, default=4, dest="compression_ratio",
                         help="Gist compression ratio passed to /v1/c2kv/extract (default: 4)")
+    parser.add_argument(
+        "--c2kv-reuse",
+        choices=("required", "best_effort"),
+        default="required",
+        help="Reuse policy placed on successfully extracted text messages (default: required)",
+    )
     parser.add_argument("--profile", action="store_true", default=False,
                         help="Record extract and chat latencies per example")
     parser.add_argument("--workers", type=int, default=1,
